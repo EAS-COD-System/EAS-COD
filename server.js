@@ -1,142 +1,173 @@
 import express from "express";
-import cookieParser from "cookie-parser";
-import crypto from "crypto";
-import fetch from "node-fetch";
-import { parsePhoneNumberFromString } from "libphonenumber-js";
-import { initShopify } from "./shopify.js";
-import { db } from "./db.js";
+import cors from "cors";
+import { initShopify, requireShopifyAuth, getShopFromRequest } from "./shopify.js";
+import { isValidPhoneNumber } from "libphonenumber-js";
 
 const app = express();
+
+// --- Basic middleware ---
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+// --- Shopify init (loads API config, session storage, etc.) ---
 const shopify = initShopify();
 
-app.use(cookieParser());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// --- Health check (what you tested) ---
+app.get("/", (req, res) => {
+res.json({
+status: "ok",
+app: "EAS COD App",
+scopes: (process.env.SCOPES || "").split(",").filter(Boolean),
+});
+});
 
-// -------- helpers --------
-function verifyProxySignature(req) {
-  const { signature, ...rest } = req.query;
-  if (!signature) return false;
+/**
+* COD: Create Draft Order -> Complete -> Return order + redirect URL
+*
+* This endpoint is what your storefront form will POST to.
+* It MUST run under an installed shop session (we use Shopify auth session storage).
+*/
+app.post("/api/cod/create-order", requireShopifyAuth(shopify), async (req, res) => {
+try {
+const shop = getShopFromRequest(req);
+const session = res.locals.shopify?.session;
 
-  const msg = Object.keys(rest)
-    .sort()
-    .map(k => `${k}=${rest[k]}`)
-    .join("");
-
-  const digest = crypto
-    .createHmac("sha256", process.env.SHOPIFY_API_SECRET)
-    .update(msg)
-    .digest("hex");
-
-  return digest === signature;
+if (!shop || !session?.accessToken) {
+return res.status(401).json({ ok: false, error: "Missing Shopify session/access token" });
 }
 
-function normalizeCountry(c) {
-  const m = {
-    kenya: "KE",
-    tanzania: "TZ",
-    uganda: "UG",
-    zambia: "ZM",
-    zimbabwe: "ZW"
-  };
-  return m[c?.toLowerCase()] || c?.toUpperCase();
+const {
+variantGid, // e.g. "gid://shopify/ProductVariant/123456789"
+quantity = 1,
+firstName,
+phone,
+email = "",
+address1,
+city = "",
+province = "",
+countryCode, // "KE","TZ","UG","ZM","ZW"
+note = "",
+thankYouUrl, // e.g. "https://eastafrica.shop/pages/thank-you"
+} = req.body || {};
+
+// --- Validation ---
+if (!variantGid || typeof variantGid !== "string") {
+return res.status(400).json({ ok: false, error: "variantGid is required" });
+}
+if (!firstName || !phone || !address1 || !countryCode) {
+return res.status(400).json({ ok: false, error: "Missing required fields" });
+}
+const qty = Number(quantity);
+if (!Number.isFinite(qty) || qty < 1 || qty > 20) {
+return res.status(400).json({ ok: false, error: "Invalid quantity" });
 }
 
-// -------- OAuth --------
-app.get("/auth", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop) return res.send("Missing shop");
+// Phone validation per country
+// If you want stricter rules per country later, we can enforce exact prefixes/lengths.
+if (!isValidPhoneNumber(phone, countryCode)) {
+return res.status(400).json({ ok: false, error: `Invalid phone number for ${countryCode}` });
+}
 
-  const redirect = await shopify.auth.begin({
-    shop,
-    callbackPath: "/auth/callback",
-    isOnline: false,
-    rawRequest: req,
-    rawResponse: res
-  });
-
-  res.redirect(redirect);
+// --- Shopify Admin GraphQL client ---
+const client = new shopify.clients.Graphql({
+session: {
+shop,
+accessToken: session.accessToken,
+},
 });
 
-app.get("/auth/callback", async (req, res) => {
-  const { session } = await shopify.auth.callback({
-    rawRequest: req,
-    rawResponse: res
-  });
-
-  db.prepare(`
-    INSERT OR REPLACE INTO sessions (shop, access_token, created_at)
-    VALUES (?, ?, ?)
-  `).run(session.shop, session.accessToken, new Date().toISOString());
-
-  res.redirect(`https://${session.shop}/admin/apps`);
+// 1) Create draft order (COD)
+const draftCreate = await client.query({
+data: {
+query: `
+mutation DraftOrderCreate($input: DraftOrderInput!) {
+draftOrderCreate(input: $input) {
+draftOrder {
+id
+invoiceUrl
+}
+userErrors { field message }
+}
+}
+`,
+variables: {
+input: {
+email: email || null,
+note: note || "COD order",
+shippingAddress: {
+firstName,
+address1,
+city,
+province,
+countryCode,
+phone,
+},
+lineItems: [
+{
+variantId: variantGid,
+quantity: qty,
+}
+],
+},
+},
+},
 });
 
-// -------- App Proxy (COD submit) --------
-app.post("/proxy/submit", async (req, res) => {
-  if (!verifyProxySignature(req)) return res.status(401).send("Invalid");
+const createErrors = draftCreate?.body?.data?.draftOrderCreate?.userErrors || [];
+if (createErrors.length) {
+return res.status(400).json({ ok: false, error: "draftOrderCreate failed", details: createErrors });
+}
 
-  const shop = req.query.shop;
-  const session = db.prepare("SELECT * FROM sessions WHERE shop=?").get(shop);
-  if (!session) return res.status(400).send("Not installed");
+const draftId = draftCreate.body.data.draftOrderCreate.draftOrder.id;
 
-  const {
-    variant_id,
-    quantity,
-    full_name,
-    phone,
-    address,
-    city,
-    country,
-    price,
-    currency
-  } = req.body;
-
-  const iso = normalizeCountry(country);
-  const parsed = parsePhoneNumberFromString(phone, iso);
-  if (!parsed || !parsed.isValid()) {
-    return res.json({ ok: false, error: "Invalid phone number" });
-  }
-
-  const order = {
-    order: {
-      financial_status: "pending",
-      currency,
-      line_items: [
-        {
-          variant_id: Number(variant_id),
-          quantity: Number(quantity),
-          price: String(Math.round(price))
-        }
-      ],
-      shipping_address: {
-        name: full_name,
-        phone: parsed.number,
-        address1: address,
-        city,
-        country_code: iso
-      }
-    }
-  };
-
-  const r = await fetch(`https://${shop}/admin/api/2025-01/orders.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": session.access_token,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(order)
-  });
-
-  const data = await r.json();
-  if (!r.ok) return res.json({ ok: false, error: data });
-
-  res.json({
-    ok: true,
-    redirect: process.env.THANK_YOU_URL
-  });
+// 2) Complete draft order -> creates a real Order in Shopify
+const draftComplete = await client.query({
+data: {
+query: `
+mutation DraftOrderComplete($id: ID!, $paymentPending: Boolean!) {
+draftOrderComplete(id: $id, paymentPending: $paymentPending) {
+draftOrder {
+id
+order {
+id
+name
+}
+}
+userErrors { field message }
+}
+}
+`,
+variables: {
+id: draftId,
+paymentPending: true
+},
+},
 });
 
-app.get("/", (_, res) => res.send("EAS COD APP RUNNING"));
+const completeErrors = draftComplete?.body?.data?.draftOrderComplete?.userErrors || [];
+if (completeErrors.length) {
+return res.status(400).json({ ok: false, error: "draftOrderComplete failed", details: completeErrors });
+}
 
-app.listen(process.env.PORT || 3000);
+const order = draftComplete.body.data.draftOrderComplete.draftOrder.order;
+
+// Redirect URL to your custom thank-you page
+const redirect = (thankYouUrl || "https://eastafrica.shop/pages/thank-you")
++ `?order=${encodeURIComponent(order?.name || "")}&country=${encodeURIComponent(countryCode)}`;
+
+return res.json({
+ok: true,
+orderId: order?.id || null,
+orderName: order?.name || null,
+redirect,
+});
+
+} catch (err) {
+console.error("create-order error:", err);
+return res.status(500).json({ ok: false, error: "Server error" });
+}
+});
+
+// --- Start server ---
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
