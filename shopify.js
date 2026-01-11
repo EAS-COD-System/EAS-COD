@@ -1,38 +1,32 @@
-import shopifyApi from "@shopify/shopify-api";
+// shopify.js
 import "@shopify/shopify-api/adapters/node";
+import { shopifyApi, LATEST_API_VERSION } from "@shopify/shopify-api";
 
-const {
-SHOPIFY_API_KEY,
-SHOPIFY_API_SECRET,
-SCOPES,
-APP_URL,
-} = process.env;
-
-// ---- SAFETY CHECKS (NO CRASH) ----
-if (!SHOPIFY_API_KEY) {
-console.warn("⚠️ SHOPIFY_API_KEY is missing");
-}
-if (!SHOPIFY_API_SECRET) {
-console.warn("⚠️ SHOPIFY_API_SECRET is missing");
-}
-if (!APP_URL) {
-console.warn("⚠️ APP_URL is missing");
+function requireEnv(name) {
+const v = process.env[name];
+if (!v) throw new Error(`Missing env var: ${name}`);
+return v;
 }
 
-// ---- INIT SHOPIFY ----
 export function initShopify() {
-return shopifyApi.shopifyApi({
-apiKey: SHOPIFY_API_KEY || "",
-apiSecretKey: SHOPIFY_API_SECRET || "",
-scopes: (SCOPES || "")
+const appUrl = requireEnv("SHOPIFY_APP_URL"); // example: https://your-app.onrender.com
+const hostName = new URL(appUrl).host;
+
+const scopes = (process.env.SCOPES || "")
 .split(",")
 .map(s => s.trim())
-.filter(Boolean),
-hostName: APP_URL
-? APP_URL.replace(/^https?:\/\//, "")
-: "localhost",
-apiVersion: shopifyApi.LATEST_API_VERSION,
-isEmbeddedApp: true,
-sessionStorage: new shopifyApi.session.MemorySessionStorage(),
+.filter(Boolean);
+
+if (scopes.length === 0) {
+throw new Error("SCOPES env var is empty. Example: read_products,write_orders");
+}
+
+return shopifyApi({
+apiKey: requireEnv("SHOPIFY_API_KEY"),
+apiSecretKey: requireEnv("SHOPIFY_API_SECRET"),
+scopes,
+hostName,
+apiVersion: LATEST_API_VERSION,
+isEmbeddedApp: false,
 });
 }
