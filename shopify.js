@@ -1,78 +1,86 @@
-import { shopifyApi, LATEST_API_VERSION } from "@shopify/shopify-api";
-import { MemorySessionStorage } from "@shopify/shopify-api/dist/auth/session/storage/memory.js";
+// shopify.js
+import "@shopify/shopify-api/adapters/node";
+import { shopifyApi, ApiVersion, DeliveryMethod } from "@shopify/shopify-api";
 
 /**
-* IMPORTANT:
-* Memory storage resets on Render redeploy.
-* It's OK for now to get you working.
-* Later we will switch to Redis / DB session storage (production safe).
+* Minimal in-memory session storage (works fine for testing + getting Render deploy green).
+* NOTE: on Render free/starter, instances can restart -> sessions can be lost.
+* Later you should move this to Redis/DB.
 */
+class MemorySessionStorage {
+constructor() {
+this.sessions = new Map(); // key: sessionId, value: session
+}
+
+async storeSession(session) {
+this.sessions.set(session.id, session);
+return true;
+}
+
+async loadSession(id) {
+return this.sessions.get(id) || undefined;
+}
+
+async deleteSession(id) {
+return this.sessions.delete(id);
+}
+
+async deleteSessions(ids) {
+ids.forEach((id) => this.sessions.delete(id));
+return true;
+}
+
+async findSessionsByShop(shop) {
+const results = [];
+for (const session of this.sessions.values()) {
+if (session.shop === shop) results.push(session);
+}
+return results;
+}
+}
 
 export function initShopify() {
-const {
-SHOPIFY_API_KEY,
-SHOPIFY_API_SECRET,
-SHOPIFY_APP_URL,
-SCOPES,
-} = process.env;
+const apiKey = process.env.SHOPIFY_API_KEY;
+const apiSecretKey = process.env.SHOPIFY_API_SECRET;
 
-if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET || !SHOPIFY_APP_URL) {
-throw new Error("Missing required env vars: SHOPIFY_API_KEY / SHOPIFY_API_SECRET / SHOPIFY_APP_URL");
-}
+// Your Render public URL, example: https://eas-cod.onrender.com
+const appUrl = process.env.SHOPIFY_APP_URL;
+const hostName = appUrl ? appUrl.replace(/^https?:\/\//, "") : undefined;
 
-const scopes = (SCOPES || "")
+// Safe scopes parsing (prevents your crash)
+const scopesRaw =
+process.env.SCOPES ||
+process.env.SHOPIFY_SCOPES ||
+"read_products,write_draft_orders,read_orders,write_orders";
+
+const scopes = scopesRaw
 .split(",")
-.map(s => s.trim())
+.map((s) => s.trim())
 .filter(Boolean);
 
-if (!scopes.length) {
-throw new Error("SCOPES env var is missing/empty. Example: read_products,write_orders,write_draft_orders");
+if (!apiKey || !apiSecretKey || !appUrl || !hostName) {
+throw new Error(
+`Missing env vars. Required:
+- SHOPIFY_API_KEY
+- SHOPIFY_API_SECRET
+- SHOPIFY_APP_URL (example: https://eas-cod.onrender.com)
+`
+);
 }
 
-return shopifyApi({
-apiKey: SHOPIFY_API_KEY,
-apiSecretKey: SHOPIFY_API_SECRET,
+const shopify = shopifyApi({
+apiKey,
+apiSecretKey,
 scopes,
-hostName: SHOPIFY_APP_URL.replace(/^https?:\/\//, ""),
-apiVersion: LATEST_API_VERSION,
+hostName,
+apiVersion: ApiVersion.January25, // safe modern version
 isEmbeddedApp: true,
 sessionStorage: new MemorySessionStorage(),
+// If you later add webhooks:
+// webhooks: { ... }
 });
+
+return shopify;
 }
 
-/**
-* Minimal auth guard for API routes:
-* - expects ?shop=xxxxx.myshopify.com or Shopify signed request context
-* - expects we already stored a session for that shop (app installed)
-*/
-export function requireShopifyAuth(shopify) {
-return async (req, res, next) => {
-try {
-const shop = getShopFromRequest(req);
-if (!shop) return res.status(400).json({ ok: false, error: "Missing shop parameter" });
-
-// Load offline session for shop (app install created it)
-const offlineId = shopify.session.getOfflineId(shop);
-const session = await shopify.sessionStorage.loadSession(offlineId);
-
-if (!session?.accessToken) {
-return res.status(401).json({
-ok: false,
-error: "No offline session found. Install the app on the store again (or complete OAuth).",
-});
-}
-
-res.locals.shopify = { session };
-next();
-} catch (e) {
-console.error("Auth error:", e);
-return res.status(500).json({ ok: false, error: "Auth middleware error" });
-}
-};
-}
-
-export function getShopFromRequest(req) {
-// Accept from query or headers. Query is easiest.
-const shop = req.query?.shop || req.headers["x-shopify-shop-domain"];
-return typeof shop === "string" ? shop : null;
-}
+export { DeliveryMethod };
